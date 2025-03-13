@@ -1,6 +1,6 @@
-
 services:
   bot:
+    restart: always
     container_name: deepl-bot
     build: .
     image: deepl-bot
