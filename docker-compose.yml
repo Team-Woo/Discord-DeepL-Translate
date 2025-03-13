@@ -1,0 +1,9 @@
+
+services:
+  bot:
+    container_name: deepl-bot
+    build: .
+    image: deepl-bot
+    pull_policy: never
+    env_file:
+      - .env
