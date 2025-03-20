@@ -1,6 +1,7 @@
-import { Client, EmbedBuilder, GatewayIntentBits, ContextMenuCommandBuilder, ApplicationCommandType, REST, Routes, MessageFlags } from 'discord.js';
+import { Client, EmbedBuilder, GatewayIntentBits, ContextMenuCommandBuilder, ApplicationCommandType, REST, Routes, MessageFlags, Message,  Embed } from 'discord.js';
 import * as deepl from 'deepl-node';
 import dotenv from 'dotenv';
+import { TextResult } from 'deepl-node';
 
 // Load environment variables
 dotenv.config();
@@ -45,6 +46,8 @@ client.once('ready', async () => {
       Routes.applicationCommands(client.user!.id),
       { body: commands },
     );
+
+    console.log(commands)
 
     console.log('Successfully reloaded application (/) commands.');
   } catch (error) {
@@ -115,60 +118,48 @@ function getLanguageFullName(langCode: string): string {
   return langCode;
 }
 
-// Handle context menu interactions
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isMessageContextMenuCommand()) return;
+/**
+ * Extracts all translatable text from an embed
+ * @param embed The Discord embed to extract text from
+ * @returns An object containing the extracted text and its location in the embed
+ */
+function extractEmbedText(embed: Embed): { text: string; path: string }[] {
+  const textParts: { text: string; path: string }[] = [];
 
-  if (interaction.commandName === 'Translate with DeepL') {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-    try {
-      const targetMessage = interaction.targetMessage;
-      const textToTranslate = targetMessage.content;
-
-      if (!textToTranslate) {
-        await interaction.editReply('No text found to translate.');
-        return;
-      }
-
-      // Get message author
-      const messageAuthor = targetMessage.author;
-      const authorName = targetMessage.member?.displayName || messageAuthor.username;
-      const authorAvatar = messageAuthor.displayAvatarURL({ size: 128 });
-
-      // Get target language from user's locale or default to English
-      const userLocale = interaction.locale;
-      const targetLang = mapLocaleToDeepl(userLocale);
-
-      // Translate the text
-      const result = await translator.translateText(textToTranslate, null, targetLang);
-
-      // Get the full names of languages for the footer
-      const sourceLanguage = getLanguageFullName(result.detectedSourceLang);
-      const targetLanguage = getLanguageFullName(targetLang);
-
-      // Create an embed with the translation
-      const translationEmbed = new EmbedBuilder()
-        .setColor(0x0099FF)
-        .setAuthor({
-          name: authorName,
-          iconURL: authorAvatar
-        })
-        .setDescription(result.text)
-        .setFooter({
-          text: `Translated from ${sourceLanguage} to ${targetLanguage}`
-        })
-        .setTimestamp();
-
-      await interaction.editReply({
-        embeds: [translationEmbed]
-      });
-    } catch (error) {
-      console.error('Translation error:', error);
-      await interaction.editReply('An error occurred during translation.');
-    }
+  // Extract title
+  if (embed.title) {
+    textParts.push({ text: embed.title, path: 'title' });
   }
-});
+
+  // Extract description
+  if (embed.description) {
+    textParts.push({ text: embed.description, path: 'description' });
+  }
+
+  // Extract author name
+  if (embed.author?.name) {
+    textParts.push({ text: embed.author.name, path: 'author.name' });
+  }
+
+  // Extract footer text
+  if (embed.footer?.text) {
+    textParts.push({ text: embed.footer.text, path: 'footer.text' });
+  }
+
+  // Extract fields
+  if (embed.fields && embed.fields.length > 0) {
+    embed.fields.forEach((field, index) => {
+      if (field.name) {
+        textParts.push({ text: field.name, path: `fields.${index}.name` });
+      }
+      if (field.value) {
+        textParts.push({ text: field.value, path: `fields.${index}.value` });
+      }
+    });
+  }
+
+  return textParts;
+}
 
 /**
  * Maps a Discord locale to a DeepL language code.
@@ -193,6 +184,175 @@ function mapLocaleToDeepl(locale: string): deepl.TargetLanguageCode {
 
   return mapping[locale] || 'EN-US';
 }
+
+// Handle context menu interactions
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isMessageContextMenuCommand()) return;
+
+  if (interaction.commandName === 'Translate with DeepL') {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    try {
+      const targetMessage = interaction.targetMessage;
+      
+      // Get message author
+      const messageAuthor = targetMessage.author;
+      const authorName = targetMessage.member?.displayName || messageAuthor.username;
+      const authorAvatar = messageAuthor.displayAvatarURL({ size: 128 });
+
+      // Get target language from user's locale or default to English
+      const userLocale = interaction.locale;
+      const targetLang = mapLocaleToDeepl(userLocale);
+
+      // Collection to store all texts to translate
+      const textsToTranslate: { text: string; type: string; path?: string }[] = [];
+      
+      // Add message content if it exists
+      if (targetMessage.content) {
+        textsToTranslate.push({ 
+          text: targetMessage.content, 
+          type: 'content' 
+        });
+      }
+      
+      // Add embed content if embeds exist
+      if (targetMessage.embeds && targetMessage.embeds.length > 0) {
+        targetMessage.embeds.forEach((embed, embedIndex) => {
+          const embedTexts = extractEmbedText(embed);
+          embedTexts.forEach(item => {
+            textsToTranslate.push({
+              text: item.text,
+              type: 'embed',
+              path: `${embedIndex}.${item.path}`
+            });
+          });
+        });
+      }
+      
+      // If no text to translate, return an error
+      if (textsToTranslate.length === 0) {
+        await interaction.editReply('No text found to translate.');
+        return;
+      }
+      
+      // Extract just the texts for the API call
+      const textArray = textsToTranslate.map(item => item.text);
+      
+      // Translate all texts in a single API call
+      const translationResults = await translator.translateText(textArray, null, targetLang);
+      
+      // Map translation results back to their original contexts
+      const translationMap = Array.isArray(translationResults) 
+        ? translationResults.map((result, index) => ({
+            original: textsToTranslate[index],
+            translated: result.text,
+            detectedLanguage: result.detectedSourceLang
+          }))
+        : [{
+            // translator.translateText seems to not be defined completely correctly, or I just didnt look hard enough. If i misunderstand how it works this should handle it.
+            original: textsToTranslate[0],
+            translated: (translationResults as TextResult).text,
+            detectedLanguage: (translationResults as TextResult).detectedSourceLang
+          }];
+      
+      // Get message content translation if it exists
+      const contentTranslation = translationMap.find(item => item.original.type === 'content');
+      
+      // Create embeds array for the response
+      const responseEmbeds = [];
+      
+      // If there was message content, create an embed for it
+      if (contentTranslation) {
+        const contentEmbed = new EmbedBuilder()
+          .setColor(0x0099FF)
+          .setAuthor({
+            name: authorName,
+            iconURL: authorAvatar
+          })
+          .setDescription(contentTranslation.translated)
+          .setFooter({
+            text: `Translated from ${getLanguageFullName(contentTranslation.detectedLanguage)} to ${getLanguageFullName(targetLang)}`
+          })
+          .setTimestamp();
+        
+        responseEmbeds.push(contentEmbed);
+      }
+      
+      // Reconstruct each original embed with translated text
+      if (targetMessage.embeds && targetMessage.embeds.length > 0) {
+        targetMessage.embeds.forEach((originalEmbed, embedIndex) => {
+          // Create a new embed that copies the original structure
+          const translatedEmbed = EmbedBuilder.from(originalEmbed);
+          
+          // Apply translations to each part of the embed
+          translationMap.forEach(translation => {
+            if (translation.original.type === 'embed' && translation.original.path) {
+              const [index, ...pathParts] = translation.original.path.split('.');
+              if (parseInt(index) === embedIndex) {
+                const path = pathParts.join('.');
+                
+                // Apply translation based on the path
+                if (path === 'title') {
+                  translatedEmbed.setTitle(translation.translated);
+                } else if (path === 'description') {
+                  translatedEmbed.setDescription(translation.translated);
+                } else if (path === 'author.name' && originalEmbed.author) {
+                  translatedEmbed.setAuthor({
+                    name: translation.translated,
+                    iconURL: originalEmbed.author.iconURL,
+                    url: originalEmbed.author.url
+                  });
+                } else if (path === 'footer.text' && originalEmbed.footer) {
+                  translatedEmbed.setFooter({
+                    text: translation.translated,
+                    iconURL: originalEmbed.footer.iconURL
+                  });
+                } else if (path.startsWith('fields.')) {
+                  const [_, fieldIndex, fieldPart] = path.split('.');
+                  const fieldIdx = parseInt(fieldIndex);
+                  
+                  // Get all existing fields
+                  const fields = translatedEmbed.data.fields || [];
+                  
+                  // Ensure the field exists
+                  if (fields[fieldIdx]) {
+                    // Create a new field with the translated content
+                    if (fieldPart === 'name') {
+                      fields[fieldIdx].name = translation.translated;
+                    } else if (fieldPart === 'value') {
+                      fields[fieldIdx].value = translation.translated;
+                    }
+                  }
+                  
+                  // Update the fields in the embed
+                  translatedEmbed.setFields(fields);
+                }
+              }
+            }
+          });
+          
+          // Add a footer note about translation if it doesn't already have one
+          if (!translatedEmbed.data.footer) {
+            translatedEmbed.setFooter({
+              text: `Translated from ${getLanguageFullName(translationMap[0].detectedLanguage)} to ${getLanguageFullName(targetLang)}`
+            });
+          }
+          
+          responseEmbeds.push(translatedEmbed);
+        });
+      }
+      
+      // Send all the translated embeds
+      await interaction.editReply({
+        embeds: responseEmbeds
+      });
+      
+    } catch (error) {
+      console.error('Translation error:', error);
+      await interaction.editReply('An error occurred during translation.');
+    }
+  }
+});
 
 // Login to Discord
 client.login(DISCORD_TOKEN);
